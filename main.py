@@ -118,19 +118,37 @@ class ComicCompiler:
             console.print(f"[red]Error fetching {url}: {e}[/red]")
             return "Unknown Comic", []
     
-    def download_image(self, url: str, filepath: Path) -> bool:
-        """Download an image from URL to filepath."""
-        try:
-            response = self.session.get(url, timeout=30)
-            response.raise_for_status()
-            
-            with open(filepath, 'wb') as f:
-                f.write(response.content)
-            
-            return True
-        except Exception as e:
-            console.print(f"[red]Failed to download {url}: {e}[/red]")
-            return False
+    def download_image(self, url: str, filepath: Path, max_retries: int = 3) -> bool:
+        """Download an image from URL to filepath with retry logic."""
+        for attempt in range(max_retries):
+            try:
+                response = self.session.get(url, timeout=30)
+                response.raise_for_status()
+                
+                with open(filepath, 'wb') as f:
+                    f.write(response.content)
+                
+                return True
+                
+            except (requests.exceptions.ConnectionError, 
+                    requests.exceptions.Timeout,
+                    requests.exceptions.ChunkedEncodingError) as e:
+                # These are retryable errors
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+                    console.print(f"[yellow]Download failed (attempt {attempt + 1}/{max_retries}), retrying in {wait_time}s: {e}[/yellow]")
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    console.print(f"[red]Failed to download {url} after {max_retries} attempts: {e}[/red]")
+                    return False
+                    
+            except Exception as e:
+                # Non-retryable errors (404, 403, etc.)
+                console.print(f"[red]Failed to download {url}: {e}[/red]")
+                return False
+        
+        return False
     
     def create_pdf(self, images_dir: Path, output_path: Path, title: str, dpi: int = 150):
         """Create a PDF from downloaded images with pages sized to match each image."""
@@ -415,13 +433,15 @@ class ComicCompiler:
         console.print(f"[blue]Detected start number: {start_number}[/blue]")
         console.print(f"[blue]Will process issues {start_number} to {end_number}[/blue]")
         
-        all_images = []
         comic_title = None
+        total_files_created = 0
         
         for issue_num in range(start_number, end_number + 1):
             # Format number with leading zeros if original had them
             formatted_num = str(issue_num).zfill(number_length)
             issue_url = f"{base_pattern}{formatted_num}{url_suffix}"
+            
+            console.print(f"\n[cyan]Processing issue {issue_num}...[/cyan]")
             
             title, images = self.get_comic_images(issue_url)
             if not comic_title:
@@ -430,83 +450,80 @@ class ComicCompiler:
                 if not comic_title:
                     comic_title = title
             
-            if images:
-                all_images.extend(images)
-            else:
-                console.print(f"[yellow]No images found for issue {issue_num}[/yellow]")
+            if not images:
+                console.print(f"[yellow]No images found for issue {issue_num}, skipping...[/yellow]")
+                continue
             
-            # Be nice to the server
+            # Create output directory for this comic series
+            safe_title = re.sub(r'[^\w\s-]', '', comic_title).strip()
+            safe_title = re.sub(r'[-\s]+', '-', safe_title)
+            comic_dir = self.output_dir / safe_title
+            issue_dir = comic_dir / f"issue-{issue_num:02d}"
+            images_dir = issue_dir / 'images'
+            images_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Download images for this issue
+            console.print(f"[blue]Downloading {len(images)} images for issue {issue_num}...[/blue]")
+            
+            downloaded_count = 0
+            with Progress() as progress:
+                download_task = progress.add_task(f"Downloading issue {issue_num}...", total=len(images))
+                
+                for i, img_url in enumerate(images):
+                    # Generate filename
+                    img_ext = Path(urlparse(img_url).path).suffix or '.jpg'
+                    img_filename = f"{i+1:04d}{img_ext}"
+                    img_path = images_dir / img_filename
+                    
+                    if self.download_image(img_url, img_path):
+                        downloaded_count += 1
+                    
+                    progress.update(download_task, advance=1)
+                    time.sleep(0.5)  # Rate limiting
+            
+            if downloaded_count == 0:
+                console.print(f"[red]No images downloaded for issue {issue_num}, skipping...[/red]")
+                continue
+            
+            console.print(f"[green]Downloaded {downloaded_count}/{len(images)} images for issue {issue_num}[/green]")
+            
+            # Create PDF and/or EPUB for this issue
+            issue_title = f"{comic_title} #{issue_num:02d}"
+            pdf_path = issue_dir / f"{safe_title}-{issue_num:02d}.pdf"
+            epub_path = issue_dir / f"{safe_title}-{issue_num:02d}.epub"
+            
+            created_files = []
+            
+            if output_format in ["both", "pdf"]:
+                self.create_pdf(images_dir, pdf_path, issue_title, pdf_dpi)
+                created_files.append(f"PDF: {pdf_path.name}")
+                total_files_created += 1
+            
+            if output_format in ["both", "epub"]:
+                self.create_epub(images_dir, epub_path, issue_title)
+                created_files.append(f"EPUB: {epub_path.name}")
+                total_files_created += 1
+            
+            files_info = ", ".join(created_files)
+            console.print(f"[green]Created {files_info} for issue {issue_num}[/green]")
+            
+            # Be nice to the server between issues
             time.sleep(1)
         
-        if not all_images:
-            console.print("[red]No images found in any issues[/red]")
-            return False
-        
-        # Create output directory for this comic
-        safe_title = re.sub(r'[^\w\s-]', '', comic_title).strip()
-        safe_title = re.sub(r'[-\s]+', '-', safe_title)
-        comic_dir = self.output_dir / safe_title
-        images_dir = comic_dir / 'images'
-        images_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Download all images
-        console.print(f"[blue]Downloading {len(all_images)} images...[/blue]")
-        
-        downloaded_count = 0
-        with Progress() as progress:
-            download_task = progress.add_task("Downloading images...", total=len(all_images))
-            
-            for i, img_url in enumerate(all_images):
-                # Generate filename
-                img_ext = Path(urlparse(img_url).path).suffix or '.jpg'
-                img_filename = f"{i+1:04d}{img_ext}"
-                img_path = images_dir / img_filename
-                
-                if self.download_image(img_url, img_path):
-                    downloaded_count += 1
-                
-                progress.update(download_task, advance=1)
-                time.sleep(0.5)  # Rate limiting
-        
-        console.print(f"[green]Downloaded {downloaded_count}/{len(all_images)} images[/green]")
-        
-        if downloaded_count == 0:
-            console.print("[red]No images were downloaded successfully[/red]")
-            return False
-        
-        # Create PDF and/or EPUB based on format choice
-        if start_number == end_number:
-            # Single issue
-            filename_suffix = f"-{start_number:02d}"
+        # Final summary
+        if total_files_created > 0:
+            console.print(Panel(
+                Text(f"Successfully processed {comic_title}\n"
+                     f"Output directory: {self.output_dir / safe_title}\n"
+                     f"Created {total_files_created} files for issues {start_number} to {end_number}\n"
+                     f"Each issue saved in its own subdirectory", justify="center"),
+                style="bold green",
+                title="Success"
+            ))
+            return True
         else:
-            # Multiple issues
-            filename_suffix = f"-{start_number:02d}-to-{end_number:02d}"
-        
-        pdf_path = comic_dir / f"{safe_title}{filename_suffix}.pdf"
-        epub_path = comic_dir / f"{safe_title}{filename_suffix}.epub"
-        
-        created_files = []
-        
-        if output_format in ["both", "pdf"]:
-            self.create_pdf(images_dir, pdf_path, comic_title, pdf_dpi)
-            created_files.append(f"PDF: {pdf_path.name}")
-        
-        if output_format in ["both", "epub"]:
-            self.create_epub(images_dir, epub_path, comic_title)
-            created_files.append(f"EPUB: {epub_path.name}")
-        
-        files_info = "\n".join(created_files)
-        
-        console.print(Panel(
-            Text(f"Successfully processed {comic_title}\n"
-                 f"Output directory: {comic_dir}\n"
-                 f"{files_info}\n"
-                 f"Images: {downloaded_count} files in images/", justify="center"),
-            style="bold green",
-            title="Success"
-        ))
-        
-        return True
+            console.print("[red]No files were created successfully[/red]")
+            return False
 
 
 def main():
